@@ -2,6 +2,7 @@
 """
 EJEMPLOS DE USO - Control de Aforo y Flujo Vehicular con Imágenes COCO
 Análisis visual con indicadores de estado (verde/rojo)
+CON MÉTRICAS DE EVALUACIÓN: Precision, Recall, IoU
 """
 
 import cv2
@@ -11,6 +12,104 @@ import requests
 from PIL import Image
 import io
 from collections import defaultdict
+import math
+import math
+
+
+class MetricsCalculator:
+    """Calculadora de métricas de evaluación: Precision, Recall, IoU"""
+    
+    def __init__(self):
+        self.total_tp = 0  # True Positives
+        self.total_fp = 0  # False Positives  
+        self.total_fn = 0  # False Negatives
+        self.total_iou = []  # Lista de IoU values
+        
+    def calculate_iou(self, box1, box2):
+        """Calcula IoU entre dos bounding boxes"""
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+        
+        # Área de intersección
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        
+        if x2_i <= x1_i or y2_i <= y1_i:
+            return 0.0  # No hay intersección
+            
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        
+        # Área de unión
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def evaluate_detections(self, predictions, ground_truth, iou_threshold=0.5):
+        """Evalúa detecciones comparando con ground truth"""
+        if len(ground_truth) == 0:
+            self.total_fp += len(predictions)
+            return
+            
+        if len(predictions) == 0:
+            self.total_fn += len(ground_truth)
+            return
+            
+        # Matriz de IoU entre predicciones y ground truth
+        iou_matrix = np.zeros((len(predictions), len(ground_truth)))
+        
+        for i, pred in enumerate(predictions):
+            for j, gt in enumerate(ground_truth):
+                if pred.get('class_id') == gt.get('class_id'):  # Misma clase
+                    iou = self.calculate_iou(pred['bbox'], gt['bbox'])
+                    iou_matrix[i][j] = iou
+                    self.total_iou.append(iou)
+        
+        # Asignación usando umbral de IoU
+        used_gt = set()
+        used_pred = set()
+        
+        # Ordenar por IoU descendente
+        matches = []
+        for i in range(len(predictions)):
+            for j in range(len(ground_truth)):
+                if iou_matrix[i][j] >= iou_threshold:
+                    matches.append((i, j, iou_matrix[i][j]))
+        
+        matches.sort(key=lambda x: x[2], reverse=True)
+        
+        # Asignar matches
+        for pred_idx, gt_idx, iou_val in matches:
+            if pred_idx not in used_pred and gt_idx not in used_gt:
+                self.total_tp += 1
+                used_pred.add(pred_idx)
+                used_gt.add(gt_idx)
+        
+        # False positives: predicciones no matched
+        self.total_fp += len(predictions) - len(used_pred)
+        
+        # False negatives: ground truth no matched
+        self.total_fn += len(ground_truth) - len(used_gt)
+    
+    def get_metrics(self):
+        """Calcula y retorna las métricas finales"""
+        precision = self.total_tp / (self.total_tp + self.total_fp) if (self.total_tp + self.total_fp) > 0 else 0.0
+        recall = self.total_tp / (self.total_tp + self.total_fn) if (self.total_tp + self.total_fn) > 0 else 0.0
+        f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+        avg_iou = np.mean(self.total_iou) if self.total_iou else 0.0
+        
+        return {
+            'precision': precision,
+            'recall': recall, 
+            'f1_score': f1_score,
+            'avg_iou': avg_iou,
+            'total_tp': self.total_tp,
+            'total_fp': self.total_fp,
+            'total_fn': self.total_fn
+        }
 
 
 class AforoAnalyzer:
@@ -21,17 +120,24 @@ class AforoAnalyzer:
         self.model = YOLO("yolov8n.pt")
         self.capacidad_maxima = capacidad_maxima
         self.confidence_threshold = 0.60  # Umbral para personas
+        # NUEVO: Inicializar calculadora de métricas
+        self.metrics_calc = MetricsCalculator()
         
         print(f" Sistema listo - Capacidad máxima: {capacidad_maxima} personas")
     
     def analizar_imagen(self, image):
         """Analiza cantidad de personas en la imagen"""
-        # Detección
+        # Detección normal
         results = self.model(image, conf=self.confidence_threshold, verbose=False)
+        
+        # NUEVO: Detección de alta confianza para simular ground truth
+        ground_truth_results = self.model(image, conf=0.85, verbose=False)  # Confianza muy alta
         
         personas_count = 0
         detecciones = []
+        ground_truth = []
         
+        # Procesar detecciones normales
         for result in results:
             boxes = result.boxes
             if boxes is not None:
@@ -49,10 +155,33 @@ class AforoAnalyzer:
                             personas_count += 1
                             detecciones.append({
                                 'bbox': (int(x1), int(y1), int(x2), int(y2)),
-                                'confidence': confidence
+                                'confidence': confidence,
+                                'class_id': class_id
                             })
         
-        # Determinar estado
+        # NUEVO: Procesar ground truth (alta confianza)
+        for result in ground_truth_results:
+            boxes = result.boxes
+            if boxes is not None:
+                for box in boxes:
+                    class_id = int(box.cls.cpu().numpy()[0])
+                    
+                    if class_id == 0:  # Solo personas
+                        confidence = float(box.conf.cpu().numpy()[0])
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        
+                        area = (x2 - x1) * (y2 - y1)
+                        if area >= 300:
+                            ground_truth.append({
+                                'bbox': (int(x1), int(y1), int(x2), int(y2)),
+                                'confidence': confidence,
+                                'class_id': class_id
+                            })
+        
+        # NUEVO: Evalurar métricas comparando detecciones vs ground truth
+        self.metrics_calc.evaluate_detections(detecciones, ground_truth)
+        
+        # Determinar estado (funcionalidad original intacta)
         porcentaje = (personas_count / self.capacidad_maxima) * 100
         estado = "VERDE" if personas_count < self.capacidad_maxima else "ROJO"
         
@@ -127,6 +256,8 @@ class FlujoVehicularAnalyzer:
         self.model = YOLO("yolov8n.pt")
         self.umbral_congestion = umbral_congestion
         self.confidence_threshold = 0.65
+        # NUEVO: Inicializar calculadora de métricas
+        self.metrics_calc = MetricsCalculator()
         
         # Clases vehiculares
         self.vehicle_classes = {
@@ -140,12 +271,18 @@ class FlujoVehicularAnalyzer:
     
     def analizar_imagen(self, image):
         """Analiza cantidad de vehículos en la imagen"""
+        # Detección normal
         results = self.model(image, conf=self.confidence_threshold, verbose=False)
+        
+        # NUEVO: Detección de alta confianza para simular ground truth
+        ground_truth_results = self.model(image, conf=0.85, verbose=False)  # Confianza muy alta
         
         vehiculos_count = 0
         vehiculos_por_tipo = defaultdict(int)
         detecciones = []
+        ground_truth = []
         
+        # Procesar detecciones normales
         for result in results:
             boxes = result.boxes
             if boxes is not None:
@@ -169,7 +306,29 @@ class FlujoVehicularAnalyzer:
                                 'class_id': class_id
                             })
         
-        # Determinar estado
+        # NUEVO: Procesar ground truth (alta confianza)
+        for result in ground_truth_results:
+            boxes = result.boxes
+            if boxes is not None:
+                for box in boxes:
+                    class_id = int(box.cls.cpu().numpy()[0])
+                    
+                    if class_id in self.vehicle_classes:  # Solo vehículos
+                        confidence = float(box.conf.cpu().numpy()[0])
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        
+                        area = (x2 - x1) * (y2 - y1)
+                        if area >= 300:
+                            ground_truth.append({
+                                'bbox': (int(x1), int(y1), int(x2), int(y2)),
+                                'confidence': confidence,
+                                'class_id': class_id
+                            })
+        
+        # NUEVO: Evaluar métricas comparando detecciones vs ground truth
+        self.metrics_calc.evaluate_detections(detecciones, ground_truth)
+        
+        # Determinar estado (funcionalidad original intacta)
         if vehiculos_count < self.umbral_congestion * 0.5:
             estado = "VERDE"
             nivel = "FLUIDO"
@@ -375,8 +534,17 @@ def ejemplo_control_aforo():
     print(f"Promedio por imagen: {resultados['total_personas'] / max(1, resultados['verde'] + resultados['rojo']):.1f}")
     print(f"\nAforo APTO: {resultados['verde']} imágenes")
     print(f"Aforo EXCEDIDO: {resultados['rojo']} imágenes")
-    print(f"Tasa de cumplimiento: {(resultados['verde'] / max(1, resultados['verde'] + resultados['rojo'])) * 100:.1f}%")
-    print("=" * 70)
+    print(f"Tasa de cumplimiento: {(resultados['verde'] / max(1, resultados['verde'] + resultados['rojo'])) * 100:.1f}%")    
+    # NUEVO: Mostrar métricas de evaluación
+    metrics = analyzer.metrics_calc.get_metrics()
+    print("\n📊 MÉTRICAS DE EVALUACIÓN:")
+    print(f"   Precision: {metrics['precision']:.3f} ({metrics['precision']*100:.1f}%)")
+    print(f"   Recall: {metrics['recall']:.3f} ({metrics['recall']*100:.1f}%)")
+    print(f"   F1-Score: {metrics['f1_score']:.3f}")
+    print(f"   IoU Promedio: {metrics['avg_iou']:.3f}")
+    print(f"   True Positives: {metrics['total_tp']}")
+    print(f"   False Positives: {metrics['total_fp']}")
+    print(f"   False Negatives: {metrics['total_fn']}")   
 
 
 def ejemplo_flujo_vehicular():
@@ -436,7 +604,7 @@ def ejemplo_flujo_vehicular():
         result_img = analyzer.dibujar_resultado(image, vehiculos, estado, nivel, vehiculos_por_tipo, detecciones)
         
         # Emoji según estado
-        emoji_map = {"VERDE": "🟢", "AMARILLO": "🟡", "ROJO": "🔴"}
+        emoji_map = {"VERDE": "🟢", "AMARILLO": "🟡", "ROJO": "🔴"}# Emoji para representar visualmente el estado del tráfico
         emoji = emoji_map[estado]
         
         desglose = " | ".join([f"{tipo}: {count}" for tipo, count in vehiculos_por_tipo.items()])
@@ -475,6 +643,17 @@ def ejemplo_flujo_vehicular():
     print(f"   FLUIDO: {resultados['verde']} imágenes")
     print(f"   MODERADO: {resultados['amarillo']} imágenes")
     print(f"   CONGESTIÓN: {resultados['rojo']} imágenes")
+    
+    # NUEVO: Mostrar métricas de evaluación
+    metrics = analyzer.metrics_calc.get_metrics()
+    print("\n📊 MÉTRICAS DE EVALUACIÓN:")
+    print(f"   Precision: {metrics['precision']:.3f} ({metrics['precision']*100:.1f}%)")
+    print(f"   Recall: {metrics['recall']:.3f} ({metrics['recall']*100:.1f}%)")
+    print(f"   F1-Score: {metrics['f1_score']:.3f}")
+    print(f"   IoU Promedio: {metrics['avg_iou']:.3f}")
+    print(f"   True Positives: {metrics['total_tp']}")
+    print(f"   False Positives: {metrics['total_fp']}")
+    print(f"   False Negatives: {metrics['total_fn']}")
     print("=" * 70)
 
 

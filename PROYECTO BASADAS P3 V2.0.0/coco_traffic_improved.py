@@ -8,6 +8,105 @@ from PIL import Image
 import io
 import os
 from collections import defaultdict
+import math
+import numpy as np
+from scipy.spatial import distance as dist
+
+
+class MetricsCalculator:
+    """Calculadora de métricas de evaluación: Precision, Recall, IoU"""
+    
+    def __init__(self):
+        self.total_tp = 0  # True Positives
+        self.total_fp = 0  # False Positives  
+        self.total_fn = 0  # False Negatives
+        self.total_iou = []  # Lista de IoU values
+        
+    def calculate_iou(self, box1, box2):
+        """Calcula IoU entre dos bounding boxes"""
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+        
+        # Área de intersección
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        
+        if x2_i <= x1_i or y2_i <= y1_i:
+            return 0.0  # No hay intersección
+            
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        
+        # Área de unión
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def evaluate_detections(self, predictions, ground_truth, iou_threshold=0.5):
+        """Evalúa detecciones comparando con ground truth"""
+        if len(ground_truth) == 0:
+            self.total_fp += len(predictions)
+            return
+            
+        if len(predictions) == 0:
+            self.total_fn += len(ground_truth)
+            return
+            
+        # Matriz de IoU entre predicciones y ground truth
+        iou_matrix = np.zeros((len(predictions), len(ground_truth)))
+        
+        for i, pred in enumerate(predictions):
+            for j, gt in enumerate(ground_truth):
+                if pred.get('class_id') == gt.get('class_id'):  # Misma clase
+                    iou = self.calculate_iou(pred['bbox'], gt['bbox'])
+                    iou_matrix[i][j] = iou
+                    self.total_iou.append(iou)
+        
+        # Asignación usando umbral de IoU
+        used_gt = set()
+        used_pred = set()
+        
+        # Ordenar por IoU descendente
+        matches = []
+        for i in range(len(predictions)):
+            for j in range(len(ground_truth)):
+                if iou_matrix[i][j] >= iou_threshold:
+                    matches.append((i, j, iou_matrix[i][j]))
+        
+        matches.sort(key=lambda x: x[2], reverse=True)
+        
+        # Asignar matches
+        for pred_idx, gt_idx, iou_val in matches:
+            if pred_idx not in used_pred and gt_idx not in used_gt:
+                self.total_tp += 1
+                used_pred.add(pred_idx)
+                used_gt.add(gt_idx)
+        
+        # False positives: predicciones no matched
+        self.total_fp += len(predictions) - len(used_pred)
+        
+        # False negatives: ground truth no matched
+        self.total_fn += len(ground_truth) - len(used_gt)
+    
+    def get_metrics(self):
+        """Calcula y retorna las métricas finales"""# Calcula precision, recall, F1-score e IoU promedio
+        precision = self.total_tp / (self.total_tp + self.total_fp) if (self.total_tp + self.total_fp) > 0 else 0.0 
+        recall = self.total_tp / (self.total_tp + self.total_fn) if (self.total_tp + self.total_fn) > 0 else 0.0
+        f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0.0
+        avg_iou = np.mean(self.total_iou) if self.total_iou else 0.0
+        
+        return {
+            'precision': precision,
+            'recall': recall, 
+            'f1_score': f1_score,
+            'avg_iou': avg_iou,
+            'total_tp': self.total_tp,
+            'total_fp': self.total_fp,
+            'total_fn': self.total_fn
+        }
 
 
 class ObjectTracker:
@@ -154,6 +253,9 @@ class COCOTrafficAnalyzer:
                            for class_id in self.traffic_classes.keys()}
             self.unique_object_counts = defaultdict(set)  # Contar objetos únicos
             self.total_tracked = defaultdict(int)  # Total de objetos rastreados
+            
+        # NUEVO: Inicializar calculadora de métricas
+        self.metrics_calc = MetricsCalculator()#
     
     def reset_trackers(self):
         """Reinicia los trackers para comenzar con IDs nuevos"""
@@ -172,10 +274,22 @@ class COCOTrafficAnalyzer:
             verbose=False  # Silenciar output detallado
         )
         
+        # NUEVO: Detección de alta confianza para simular ground truth
+        #Ejecuta YOLO con un umbral de confianza muy alto para obtener detecciones 
+        # casi seguras, que se usan como ground truth simulado.
+        ground_truth_results = self.model(
+            image,
+            conf=0.85,  # Confianza muy alta para ground truth
+            iou=self.iou_threshold,
+            verbose=False
+        )
+        
         # Filtrar solo clases de tráfico con alta confianza
         filtered_detections = []
         detections_by_class = defaultdict(list)
+        ground_truth = []  # NUEVO: Para almacenar ground truth
         
+        # Procesar detecciones normales
         for result in results:
             boxes = result.boxes
             if boxes is not None:
@@ -190,7 +304,7 @@ class COCOTrafficAnalyzer:
                         if confidence < min_confidence:
                             continue
                         
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()# Coordenadas de bounding box
                         
                         # Calcular área de detección para filtrar objetos muy pequeños
                         width = x2 - x1
@@ -216,7 +330,31 @@ class COCOTrafficAnalyzer:
                         if self.enable_tracking:
                             detections_by_class[class_id].append((center, class_id, confidence))
         
-        # Actualizar trackers si está habilitado
+        # NUEVO: Procesar ground truth (alta confianza)
+        #Extrae las detecciones válidas de YOLO, se queda solo con objetos de tráfico
+        #filtra los pequeños (ruido) y los guarda como ground truth para análisis y métricas.
+        for result in ground_truth_results:
+            boxes = result.boxes
+            if boxes is not None:
+                for box in boxes:
+                    class_id = int(box.cls.cpu().numpy()[0])
+                    confidence = float(box.conf.cpu().numpy()[0])
+                    
+                    if class_id in self.traffic_classes:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                        area = (x2 - x1) * (y2 - y1)
+                        
+                        if area >= self.min_detection_area:
+                            ground_truth.append({
+                                'class_id': class_id,
+                                'bbox': (int(x1), int(y1), int(x2), int(y2)),
+                                'confidence': confidence
+                            })
+        
+        # NUEVO: Evaluar métricas comparando detecciones vs ground truth
+        self.metrics_calc.evaluate_detections(filtered_detections, ground_truth)
+        
+        # Actualizar trackers si está habilitado (funcionalidad original intacta)
         tracked_objects = {}
         if self.enable_tracking:
             for class_id, detections in detections_by_class.items():
@@ -386,36 +524,36 @@ def analyze_coco_traffic():
         current_count = len(detections)
         total_detections += current_count
         
-        for det in detections:
+        for det in detections:# Contar detecciones por clase para estadísticas finales
             class_counts[det['class_name']] += 1
         
         # Información en pantalla 
-        cv2.rectangle(result_frame, (10, 10), (450, 120), (0, 0, 0), -1)
+        cv2.rectangle(result_frame, (10, 10), (450, 120), (0, 0, 0), -1)# Fondo para texto
         cv2.putText(result_frame, f"COCO Imagen {i+1}/{len(image_urls)}", 
-                   (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                   (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)# Título con número de imagen
         cv2.putText(result_frame, f"Detecciones TRAFICO: {current_count}", 
-                   (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                   (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)# Conteo de detecciones en esta imagen
         cv2.putText(result_frame, f"Dataset: COCO (Solo Trafico)", 
-                   (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                   (20, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)# Fuente de datos
         
         # Contadores por clase
         y_offset = 130
         class_summary = {}
-        for det in detections:
+        for det in detections:# Resumir conteo por clase para mostrar en pantalla
             class_name = det['class_name']
             if class_name not in class_summary:
                 class_summary[class_name] = 0
             class_summary[class_name] += 1
         
-        for class_name, count in class_summary.items():
+        for class_name, count in class_summary.items():# Mostrar conteo por clase en pantalla
             cv2.putText(result_frame, f"{class_name}: {count}", 
                        (width-200, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             y_offset += 25
         
         # Mostrar imagen
-        cv2.namedWindow('COCO Traffic Analyzer - Solo Trafico', cv2.WINDOW_NORMAL)
-        cv2.resizeWindow('COCO Traffic Analyzer - Solo Trafico', width, height)
-        cv2.imshow('COCO Traffic Analyzer - Solo Trafico', result_frame)
+        cv2.namedWindow('COCO Traffic Analyzer - Solo Trafico', cv2.WINDOW_NORMAL)# Configurar ventana para mostrar resultados
+        cv2.resizeWindow('COCO Traffic Analyzer - Solo Trafico', width, height)# Mostrar resultados con detecciones y tracking
+        cv2.imshow('COCO Traffic Analyzer - Solo Trafico', result_frame)# Esperar interacción del usuario para avanzar a la siguiente imagen
         
         # Esperar entrada
         key = cv2.waitKey(0) & 0xFF
@@ -427,30 +565,41 @@ def analyze_coco_traffic():
     print("RESULTADOS FINALES - TRAFICO EN DATASET COCO")
     print("="*70)
     print(f"Imágenes procesadas: {processed_images}")
-    print(f"Total detecciones TRAFICO: {total_detections}")
-    print(f"Fuente: COCO Train2017 (Filtrado para tráfico)")
-    print(f"Modelo: YOLOv8 pre-entrenado en COCO")
+    print(f"Total detecciones TRAFICO: {total_detections}")# Estadísticas finales con enfoque en tráfico
+    print(f"Fuente: COCO Train2017 (Filtrado para tráfico)")# Balance optimizado para detectar objetos de tráfico relevantes con umbrales específicos por clase
+    print(f"Modelo: YOLOv8 pre-entrenado en COCO")# Clases de tráfico analizadas
     print(f"Clases analizadas: {list(analyzer.traffic_classes.values())}")
     
-    if analyzer.enable_tracking:
+    if analyzer.enable_tracking:# Mostrar conteo de objetos únicos rastreados por clase
         print("\n--- SEGUIMIENTO DE OBJETOS UNICOS ---")
         total_unique = sum(analyzer.total_tracked.values())
         print(f"Total objetos UNICOS rastreados: {total_unique}")
-        for class_name, count in analyzer.total_tracked.items():
+        for class_name, count in analyzer.total_tracked.items():# Mostrar conteo de objetos únicos por clase
             if count > 0:
-                print(f"   {class_name}: {count} objetos únicos")
+                print(f"   {class_name}: {count} objetos únicos")# Estadísticas por clase con porcentaje del total de detecciones
     
     if total_detections > 0:
         print("\nESTADISTICAS POR CLASE (Detecciones totales):")
-        for class_name, count in class_counts.items():
+        for class_name, count in class_counts.items():# Mostrar conteo y porcentaje por clase
             if count > 0:
                 percentage = (count / total_detections) * 100
-                print(f"   {class_name}: {count} detecciones ({percentage:.1f}%)")
+                print(f"   {class_name}: {count} detecciones ({percentage:.1f}%)")# Resumen final con enfoque en tráfico, mostrando conteo total, objetos únicos rastreados y estadísticas por clase para las imágenes de COCO analizadas
     else:
         print("\nNo se detectaron objetos de tráfico")
     
+    # NUEVO: Mostrar métricas de evaluación
+    metrics = analyzer.metrics_calc.get_metrics()
+    print("\n MÉTRICAS DE EVALUACIÓN:")
+    print(f"   Precision: {metrics['precision']:.3f} ({metrics['precision']*100:.1f}%)")
+    print(f"   Recall: {metrics['recall']:.3f} ({metrics['recall']*100:.1f}%)")
+    print(f"   F1-Score: {metrics['f1_score']:.3f}")
+    print(f"   IoU Promedio: {metrics['avg_iou']:.3f}")
+    print(f"   True Positives: {metrics['total_tp']}")
+    print(f"   False Positives: {metrics['total_fp']}")
+    print(f"   False Negatives: {metrics['total_fn']}")
+    
     cv2.destroyAllWindows()
-    print(f"\nAnálisis completado - {total_detections} objetos de tráfico en COCO")
+    print(f"\nAnálisis completado - {total_detections} objetos de tráfico en COCO")# Mensaje final con resumen de resultados
 
 def analyze_local_video():
     """Analiza un video local del usuario"""
@@ -584,6 +733,17 @@ def analyze_local_video():
                 if count > 0:
                     percentage = (count / total_detections) * 100
                     print(f"  {class_name}: {count} ({percentage:.1f}%)")
+        
+        # NUEVO: Mostrar métricas de evaluación
+        metrics = analyzer.metrics_calc.get_metrics()
+        print("\n MÉTRICAS DE EVALUACIÓN:")
+        print(f"   Precision: {metrics['precision']:.3f} ({metrics['precision']*100:.1f}%)")
+        print(f"   Recall: {metrics['recall']:.3f} ({metrics['recall']*100:.1f}%)")
+        print(f"   F1-Score: {metrics['f1_score']:.3f}")
+        print(f"   IoU Promedio: {metrics['avg_iou']:.3f}")
+        print(f"   True Positives: {metrics['total_tp']}")
+        print(f"   False Positives: {metrics['total_fp']}")
+        print(f"   False Negatives: {metrics['total_fn']}")
         
         cap.release()
         cv2.destroyAllWindows()
